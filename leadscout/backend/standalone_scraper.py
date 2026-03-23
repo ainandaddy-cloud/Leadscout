@@ -16,6 +16,7 @@ import sys
 import json
 import random
 import time
+import os
 from pathlib import Path
 
 # Add google maps root to path
@@ -90,11 +91,39 @@ def scrape(query: str, profession: str, job_id: str):
 
     search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
 
+    # Optional proxy mode (disabled by default):
+    #   LEADSCOUT_USE_SWIFTSHADOW=1
+    #   LEADSCOUT_PROXY_COUNTRIES=IN,US
+    #   LEADSCOUT_PROXY_PROTOCOL=http
+    use_swiftshadow = str(os.getenv("LEADSCOUT_USE_SWIFTSHADOW", "0")).strip().lower() in ("1", "true", "yes", "on")
+    proxy_cfg = None
+    if use_swiftshadow:
+        try:
+            from swiftshadow.classes import ProxyInterface
+
+            countries_raw = os.getenv("LEADSCOUT_PROXY_COUNTRIES", "")
+            countries = [c.strip().upper() for c in countries_raw.split(",") if c.strip()]
+            protocol = (os.getenv("LEADSCOUT_PROXY_PROTOCOL", "http") or "http").strip().lower()
+            if protocol not in ("http", "https", "socks5"):
+                protocol = "http"
+
+            swift = ProxyInterface(countries=countries or None, protocol=protocol)
+            proxy_value = swift.get().as_string()
+            if proxy_value:
+                proxy_cfg = {"server": proxy_value}
+                print(json.dumps({"type": "info", "data": f"Using proxy: {proxy_value}"}), flush=True)
+        except Exception as ex:
+            print(json.dumps({"type": "info", "data": f"Swiftshadow unavailable/failure: {ex}"}), flush=True)
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
-        )
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        }
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             locale="en-US",
             viewport={"width": 1280, "height": 800},
