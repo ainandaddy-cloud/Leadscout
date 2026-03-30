@@ -1,4 +1,12 @@
-# Generated lead exports
+# Generated lead exports and scrape artifacts
 output/
 leadscout/output/
 _archive/output/
+
+# Extra protection: any CSV/JSON dropped inside output folders
+**/output/*.csv
+**/output/*.json
+
+# Local scraper state
+leadscout/backend/seen_leads.json
+_archive/seen_leads.json

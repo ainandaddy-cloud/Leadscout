@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Block accidental commits of scraped datasets and local scrape state.
+blocked_files=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(output/.*|.*\.csv$|.*seen_leads\.json$)' || true)
+
+if [ -n "$blocked_files" ]; then
+  echo ""
+  echo "Commit blocked: scraped/output data detected in staged files"
+  echo "$blocked_files"
+  echo ""
+  echo "Remove them from staging, for example:"
+  echo "  git restore --staged <file>"
+  echo ""
+  echo "If you intentionally want this once, use:"
+  echo "  git commit --no-verify"
+  exit 1
+fi
+
+exit 0
