@@ -25,7 +25,8 @@ except ValueError:
 async def scrape_area_yields(query: str, profession: str):
     """
     Async generator — launches standalone_scraper.py via subprocess.Popen.
-    Reads output in a background thread, yields leads to FastAPI WebSocket.
+    Reads output in a background thread and yields typed events.
+    Event shape: {"type": "lead|info|count|blocked|error|done", "data": any}
     """
     result_queue = queue.Queue()
 
@@ -72,9 +73,10 @@ async def scrape_area_yields(query: str, profession: str):
 
         try:
             msg = json.loads(line)
-            if msg.get("type") == "lead":
-                yield msg["data"]
-            elif msg.get("type") in ("done", "error"):
+            msg_type = msg.get("type")
+            if msg_type in ("lead", "info", "count", "blocked", "error", "done"):
+                yield msg
+            if msg_type in ("done", "error", "blocked"):
                 break
         except json.JSONDecodeError:
             continue

@@ -15,7 +15,6 @@ FastAPI reads stdout line by line and streams to browser.
 import sys
 import json
 import random
-import time
 import os
 from pathlib import Path
 
@@ -23,12 +22,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
+def extract_place_id(url):
+    """Extract the place_id or normalized path from a Google Maps URL for dedup."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        # Google Maps place URLs look like:
+        # /maps/place/NAME/data=...!...!PLACE_ID
+        # We normalize by keeping only the path up to /data
+        path = parsed.path
+        # Strip query string and fragment
+        return path.split("/data")[0] if "/data" in path else path
+    except Exception:
+        return url
+
+
 def unique_preserve_order(urls):
-    seen_urls = set()
+    seen_ids = set()
     out = []
     for u in urls:
-        if u and u not in seen_urls:
-            seen_urls.add(u)
+        if not u:
+            continue
+        key = extract_place_id(u)
+        if key not in seen_ids:
+            seen_ids.add(key)
             out.append(u)
     return out
 
@@ -85,6 +102,33 @@ def collect_listing_urls(page, rounds=15, wait_ms=1400):
     return unique_preserve_order(urls)
 
 
+def page_looks_blocked(page):
+    """Detect common Google block/interstitial signals."""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+
+    text = ""
+    try:
+        text = (page.locator("body").inner_text(timeout=2500) or "").lower()
+    except Exception:
+        pass
+
+    indicators = [
+        "unusual traffic",
+        "our systems have detected",
+        "captcha",
+        "sorry",
+        "automated queries",
+        "verify you are human",
+        "recaptcha",
+    ]
+
+    haystack = f"{title}\n{text}"
+    return any(k in haystack for k in indicators)
+
+
 def scrape(query: str, profession: str, job_id: str):
     from playwright.sync_api import sync_playwright
     from utils import analyze_website, auto_enrich
@@ -115,10 +159,36 @@ def scrape(query: str, profession: str, job_id: str):
         except Exception as ex:
             print(json.dumps({"type": "info", "data": f"Swiftshadow unavailable/failure: {ex}"}), flush=True)
 
+    fast_mode = str(os.getenv("LEADSCOUT_FAST_MODE", "0")).strip().lower() in ("1", "true", "yes", "on")
+    enable_website_analysis = str(os.getenv("LEADSCOUT_ENABLE_WEBSITE_ANALYSIS", "0")).strip().lower() in ("1", "true", "yes", "on")
+    enable_owner_enrich = str(os.getenv("LEADSCOUT_ENABLE_OWNER_ENRICH", "0")).strip().lower() in ("1", "true", "yes", "on")
+    min_scroll_rounds = 12 if fast_mode else 20
+    max_scroll_rounds = 20 if fast_mode else 30
+    min_scroll_wait = 650 if fast_mode else 1200
+    max_scroll_wait = 1150 if fast_mode else 2000
+    min_detail_wait = 250 if fast_mode else 700
+    max_detail_wait = 650 if fast_mode else 1300
+
+    print(json.dumps({
+        "type": "info",
+        "data": (
+            f"Scraper mode: {'FAST' if fast_mode else 'SAFE'} | "
+            f"Website analysis: {'ON' if enable_website_analysis else 'OFF'} | "
+            f"Owner enrich: {'ON' if enable_owner_enrich else 'OFF'}"
+        )
+    }), flush=True)
+
     with sync_playwright() as p:
         launch_kwargs = {
             "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+            ],
         }
         if proxy_cfg:
             launch_kwargs["proxy"] = proxy_cfg
@@ -131,24 +201,77 @@ def scrape(query: str, profession: str, job_id: str):
         )
         page = context.new_page()
 
+        # SUPER LIGHTWEIGHT MODE: Block heavy resources to save RAM/CPU and bandwidth
+        def intercept_route(route):
+            if route.request.resource_type in ["image", "media", "font"]:
+                route.abort()
+            else:
+                route.continue_()
+        
+        page.route("**/*", intercept_route)
+
         # Navigate
         if not goto_with_retry(page, search_url, retries=3, timeout=30000):
             print(json.dumps({"type": "error", "data": "Failed to open Google Maps search URL"}), flush=True)
             browser.close()
             return
 
-        page.wait_for_timeout(random.randint(1200, 2200))
+        page.wait_for_timeout(random.randint(500, 1100) if fast_mode else random.randint(1200, 2200))
+
+        if page_looks_blocked(page):
+            print(json.dumps({
+                "type": "blocked",
+                "data": {"reason": "Block/CAPTCHA detected on Google Maps search page"}
+            }), flush=True)
+            browser.close()
+            return
 
         # Scroll + collect listing URLs
-        urls = collect_listing_urls(page, rounds=15, wait_ms=1400)
+        urls = collect_listing_urls(
+            page,
+            rounds=random.randint(min_scroll_rounds, max_scroll_rounds),
+            wait_ms=random.randint(min_scroll_wait, max_scroll_wait),
+        )
 
         # Fallback pass for temporary block/throttle pages
         if len(urls) == 0:
-            page.wait_for_timeout(random.randint(2200, 3200))
+            page.wait_for_timeout(random.randint(1800, 2800))
             if goto_with_retry(page, search_url, retries=1, timeout=30000):
-                urls = collect_listing_urls(page, rounds=20, wait_ms=2000)
+                if page_looks_blocked(page):
+                    print(json.dumps({
+                        "type": "blocked",
+                        "data": {"reason": "Google interstitial detected during fallback"}
+                    }), flush=True)
+                    browser.close()
+                    return
+                urls = collect_listing_urls(
+                    page,
+                    rounds=max_scroll_rounds,
+                    wait_ms=max_scroll_wait,
+                )
+
+        if len(urls) == 0 and page_looks_blocked(page):
+            print(json.dumps({
+                "type": "blocked",
+                "data": {"reason": "No listings due to probable temporary block"}
+            }), flush=True)
+            browser.close()
+            return
 
         print(json.dumps({"type": "count", "data": len(urls)}), flush=True)
+
+        # Internal deduplication set — prevent yielding same business twice
+        scraped_keys = set()
+
+        def make_scraper_key(name, phone, address):
+            """Create a dedup key from normalized fields."""
+            import re as _re
+            clean_phone = _re.sub(r"[^0-9]", "", str(phone or ""))
+            if len(clean_phone) >= 6:
+                return f"phone::{clean_phone}"
+            clean_name = str(name or "").strip().lower()
+            clean_addr = str(address or "").strip().lower()
+            return f"name::{clean_name}::addr::{clean_addr}"
 
         # Scrape each listing
         for i, url in enumerate(urls):
@@ -160,13 +283,22 @@ def scrape(query: str, profession: str, job_id: str):
                 "Twitter": "", "LinkedIn": "", "YouTube": "",
                 "Has_Chatbot": "", "Has_Form": "", "Mobile_Friendly": "",
                 "Dev_Opportunity": "", "Website Status": "Not Listed",
+                "has_website": False,
                 "Maps URL": url, "Profession": profession,
             }
 
             try:
                 if not goto_with_retry(page, url, retries=2, timeout=20000):
                     continue
-                page.wait_for_timeout(random.randint(700, 1300))
+                page.wait_for_timeout(random.randint(min_detail_wait, max_detail_wait))
+
+                if page_looks_blocked(page):
+                    print(json.dumps({
+                        "type": "blocked",
+                        "data": {"reason": "Blocked while opening listing details"}
+                    }), flush=True)
+                    browser.close()
+                    return
 
                 try: result["Name"]     = page.locator('h1.DUwDvf').first.inner_text(timeout=4000)
                 except: pass
@@ -191,9 +323,16 @@ def scrape(query: str, profession: str, job_id: str):
                     if website:
                         result["Website"]        = website.strip()
                         result["Website Status"] = "Present"
+                        result["has_website"]    = True
                 except: pass
 
                 result["Maps URL"] = page.url
+
+                # DEDUP CHECK: Skip if we've already yielded this business
+                lead_key = make_scraper_key(result["Name"], result["Phone"], result["Address"])
+                if lead_key in scraped_keys:
+                    continue
+                scraped_keys.add(lead_key)
 
                 # Socials
                 try:
@@ -207,7 +346,7 @@ def scrape(query: str, profession: str, job_id: str):
                 except: pass
 
                 # Website enrichment
-                if result["Website"]:
+                if result["Website"] and enable_website_analysis:
                     try:
                         analysis = analyze_website(result["Website"])
                         result["Email"]           = ", ".join(analysis["emails"]) if analysis["emails"] else ""
@@ -221,13 +360,14 @@ def scrape(query: str, profession: str, job_id: str):
                     except: pass
 
                 # Owner enrichment
-                try:
-                    enriched = auto_enrich(result["Name"], result["Website"], result["Phone"], result["Address"])
-                    result["Owner_Name"]          = enriched.get("Owner_Name", "")
-                    result["Owner_Email_Guesses"] = enriched.get("Owner_Email_Guesses", "")
-                    result["WhatsApp_Link"]        = enriched.get("WhatsApp_Link", "")
-                    result["Owner_LinkedIn"]       = enriched.get("Owner_LinkedIn", "")
-                except: pass
+                if enable_owner_enrich:
+                    try:
+                        enriched = auto_enrich(result["Name"], result["Website"], result["Phone"], result["Address"])
+                        result["Owner_Name"]          = enriched.get("Owner_Name", "")
+                        result["Owner_Email_Guesses"] = enriched.get("Owner_Email_Guesses", "")
+                        result["WhatsApp_Link"]        = enriched.get("WhatsApp_Link", "")
+                        result["Owner_LinkedIn"]       = enriched.get("Owner_LinkedIn", "")
+                    except: pass
 
                 if result.get("Name"):
                     print(json.dumps({"type": "lead", "data": result}), flush=True)
@@ -235,7 +375,7 @@ def scrape(query: str, profession: str, job_id: str):
             except Exception as e:
                 pass
 
-            page.wait_for_timeout(random.randint(700, 1300))
+            page.wait_for_timeout(random.randint(min_detail_wait, max_detail_wait))
 
         browser.close()
         print(json.dumps({"type": "done", "data": len(urls)}), flush=True)

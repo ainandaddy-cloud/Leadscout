@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import Nav from "../components/Nav"
 import SparklesBg from "../components/SparklesBg"
 
-const API = "http://localhost:8000"
+const API = import.meta.env.VITE_API_URL || "http://localhost:8001"
 
 export default function AdminPage({ user, onLogout }) {
   const [users, setUsers] = useState([])

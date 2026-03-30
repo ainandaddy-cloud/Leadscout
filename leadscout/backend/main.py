@@ -20,6 +20,21 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Head
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import logging
+
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(
+            x in msg for x in [
+                "GET /scrape/status/",
+                "GET /user/history/",
+                "GET /scrape/heartbeat/"
+            ]
+        )
+
+# Add to uvicorn access logger
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 app = FastAPI(title="LeadScout API")
 app.add_middleware(
@@ -51,7 +66,9 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
 
 
 DB_FLUSH_EVERY = _env_int("LEADSCOUT_DB_FLUSH_EVERY", 80, 10, 500)
-AREA_CONCURRENCY = _env_int("LEADSCOUT_AREA_CONCURRENCY", 2, 1, 10)
+AREA_CONCURRENCY = _env_int("LEADSCOUT_AREA_CONCURRENCY", 1, 1, 10)
+BLOCK_COOLDOWN_SECONDS = _env_int("LEADSCOUT_BLOCK_COOLDOWN_SECONDS", 300, 30, 1800)
+BLOCK_RECOVERY_MAX_ATTEMPTS = _env_int("LEADSCOUT_BLOCK_RECOVERY_MAX_ATTEMPTS", 12, 1, 100)
 
 
 def _safe_slug(value: str) -> str:
@@ -263,31 +280,107 @@ async def run_job(job_id: str):
 
                 publish_event(job, {
                     "type": "progress",
-                    "data": {"current": current_done, "total": total, "query": query}
+                    "data": {"current": current_done, "total": total, "query": query, "maps_url": ""}
                 })
 
+                finished_naturally = False
                 try:
-                    async for lead in scrape_area_yields(query, profession):
-                        if job.get("cancelled"):
-                            break
+                    recovery_attempt = 0
+                    while not job.get("cancelled") and recovery_attempt < BLOCK_RECOVERY_MAX_ATTEMPTS:
+                        blocked_detected = False
+                        blocked_reason = "Google Maps temporarily blocked requests"
+                        got_terminal_event = False
 
-                        lead["Search Query"] = query
-                        should_publish = False
-                        async with state_lock:
-                            lead_key = make_lead_key(lead)
-                            if lead_key not in seen:
-                                seen.add(lead_key)
-                                pending_rows.append((job_id, user_id, json.dumps(lead)))
-                                if len(pending_rows) >= DB_FLUSH_EVERY:
-                                    flush_pending()
-                                should_publish = True
+                        async for event in scrape_area_yields(query, profession):
+                            if job.get("cancelled"):
+                                break
 
-                        if should_publish:
-                            publish_event(job, {"type": "lead", "data": lead})
-                        await asyncio.sleep(0)
+                            evt_type = (event or {}).get("type")
+                            evt_data = (event or {}).get("data")
+
+                            if evt_type == "lead":
+                                lead = evt_data or {}
+                                lead["Search Query"] = query
+                                maps_url = lead.get("Maps URL", "")
+                                website_url = lead.get("Website", "")
+                                should_publish = False
+                                async with state_lock:
+                                    lead_key = make_lead_key(lead)
+                                    if lead_key not in seen:
+                                        seen.add(lead_key)
+                                        pending_rows.append((job_id, user_id, json.dumps(lead)))
+                                        if len(pending_rows) >= DB_FLUSH_EVERY:
+                                            flush_pending()
+                                        should_publish = True
+
+                                if should_publish:
+                                    publish_event(job, {"type": "lead", "data": lead})
+                                    publish_event(job, {
+                                        "type": "url",
+                                        "data": {"maps_url": maps_url, "website_url": website_url, "name": lead.get("Name", "")}
+                                    })
+                            elif evt_type == "info":
+                                publish_event(job, {"type": "info", "data": str(evt_data or "")})
+                            elif evt_type == "count":
+                                publish_event(job, {"type": "info", "data": f"Candidates discovered: {evt_data}"})
+                            elif evt_type == "blocked":
+                                blocked_detected = True
+                                blocked_reason = str((evt_data or {}).get("reason") or blocked_reason)
+                                got_terminal_event = True
+                                break
+                            elif evt_type == "error":
+                                msg = str(evt_data or "")
+                                if "blocked" in msg.lower() or "captcha" in msg.lower() or "unusual traffic" in msg.lower():
+                                    blocked_detected = True
+                                    blocked_reason = msg
+                                else:
+                                    publish_event(job, {"type": "info", "data": msg})
+                                got_terminal_event = True
+                                break
+                            elif evt_type == "done":
+                                got_terminal_event = True
+                                break
+
+                            await asyncio.sleep(0)
+
+                        if blocked_detected:
+                            recovery_attempt += 1
+                            publish_event(job, {
+                                "type": "block_wait",
+                                "data": {
+                                    "query": query,
+                                    "reason": blocked_reason,
+                                    "retry_attempt": recovery_attempt,
+                                    "retry_limit": BLOCK_RECOVERY_MAX_ATTEMPTS,
+                                    "wait_seconds": BLOCK_COOLDOWN_SECONDS,
+                                },
+                            })
+                            for _ in range(BLOCK_COOLDOWN_SECONDS):
+                                if job.get("cancelled"):
+                                    break
+                                await asyncio.sleep(1)
+                            continue
+
+                        if got_terminal_event:
+                            finished_naturally = True
+                        else:
+                            # Subprocess exited without an explicit terminal event.
+                            # Consider this area completed to avoid endless resume loops.
+                            finished_naturally = True
+                        break
+
+                    if not finished_naturally and recovery_attempt >= BLOCK_RECOVERY_MAX_ATTEMPTS:
+                        publish_event(job, {
+                            "type": "error",
+                            "data": (
+                                f"Stopped query after {BLOCK_RECOVERY_MAX_ATTEMPTS} block-recovery attempts: {query}. "
+                                "You can resume later from history."
+                            ),
+                        })
                 finally:
                     async with state_lock:
-                        completed_indexes.add(i)
+                        if finished_naturally and not job.get("cancelled"):
+                            completed_indexes.add(i)
                         processed_areas = len(completed_indexes)
                         job["processed_areas"] = processed_areas
                         flush_pending(force_save_seen=True)
@@ -559,6 +652,56 @@ def stop_scrape(job_id: str):
     return {"ok": True}
 
 
+@app.delete("/scrape/job/{job_id}")
+def delete_job(job_id: str, x_user_id: str = Header(None)):
+    """Delete a scrape job and its associated leads."""
+    conn = get_db()
+    row = conn.execute("SELECT user_id FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Job not found")
+    if x_user_id and row["user_id"] != x_user_id:
+        conn.close()
+        raise HTTPException(403, "You can only delete your own jobs")
+
+    # Stop if running
+    if job_id in active_jobs:
+        active_jobs[job_id]["cancelled"] = True
+        active_jobs[job_id]["status"] = "stopped"
+
+    # Delete leads and job from DB
+    conn.execute("DELETE FROM leads WHERE job_id=?", (job_id,))
+    conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+    conn.commit()
+    conn.close()
+
+    # Remove CSV file if exists
+    csv_path = build_job_csv_path(row.get("niche", "leads") if hasattr(row, "get") else "leads", job_id)
+    try:
+        if Path(csv_path).exists():
+            Path(csv_path).unlink()
+    except Exception:
+        pass
+
+    # Cleanup in-memory
+    active_jobs.pop(job_id, None)
+    return {"ok": True, "deleted_job_id": job_id}
+
+
+@app.get("/scrape/heartbeat/{job_id}")
+def heartbeat(job_id: str):
+    """Lightweight heartbeat for sleep/wake detection."""
+    if job_id in active_jobs:
+        job = active_jobs[job_id]
+        return {
+            "alive": True,
+            "status": job.get("status", "unknown"),
+            "lead_count": int(job.get("lead_count", 0)),
+            "processed_areas": int(job.get("processed_areas", 0)),
+        }
+    return {"alive": False, "status": "not_running"}
+
+
 @app.post("/scrape/resume/{job_id}")
 async def resume_scrape(job_id: str, body: ResumeBody):
     conn = get_db()
@@ -584,11 +727,9 @@ async def resume_scrape(job_id: str, body: ResumeBody):
 
     if body.restart_from_beginning:
         remaining = original_areas
-    elif completed_indexes:
-        remaining = [area for idx, area in enumerate(original_areas) if idx not in completed_indexes]
     else:
-        # Backward compatibility for legacy jobs created before completed index tracking.
-        remaining = original_areas[processed:]
+        # Resume replays ALL areas not fully completed — including the one that was mid-scrape.
+        remaining = [area for idx, area in enumerate(original_areas) if idx not in completed_indexes]
 
     if not remaining:
         raise HTTPException(400, "No remaining areas to resume")
@@ -629,11 +770,13 @@ def scrape_status(job_id: str):
             "total_areas": int(job.get("total_areas", 0)),
             "current_query": job.get("current_query", ""),
             "running": job.get("status") in ("running", "stopping"),
+            "profession": job.get("profession", ""),
+            "location": job.get("location", ""),
         }
 
     conn = get_db()
     row = conn.execute(
-        "SELECT job_id,status,lead_count,csv_path,processed_areas,total_areas FROM jobs WHERE job_id=?",
+        "SELECT job_id,status,lead_count,csv_path,processed_areas,total_areas,profession,location FROM jobs WHERE job_id=?",
         (job_id,),
     ).fetchone()
     conn.close()
@@ -658,6 +801,8 @@ def scrape_status(job_id: str):
         "current_query": "",
         "running": False,
         "csv_path": row["csv_path"],
+        "profession": row["profession"] or "",
+        "location": row["location"] or "",
     }
 
 
@@ -748,8 +893,10 @@ def download_merged_job_ids_csv(user_id: str, job_ids: str):
 @app.websocket("/ws/{job_id}")
 async def ws_scrape(ws: WebSocket, job_id: str):
     await ws.accept()
+    logging.info(f"[WS] Accepted connection for job {job_id[:8]}")
 
     if job_id not in active_jobs:
+        logging.warning(f"[WS] Job {job_id[:8]} not in active_jobs — sending error and closing")
         await ws.send_json({"type": "error", "data": "Job not found"})
         await ws.close()
         return
@@ -758,28 +905,66 @@ async def ws_scrape(ws: WebSocket, job_id: str):
     queue = asyncio.Queue(maxsize=WS_QUEUE_MAXSIZE)
     job.setdefault("listeners", set()).add(queue)
 
+    async def send_loop():
+        try:
+            # CRITICAL: Copy the list so concurrent appends/trims by publish_event
+            # during our async iteration (at each await) don't corrupt the iterator.
+            cached_events = list(job.get("events", []))
+            logging.info(f"[WS] Replaying {len(cached_events)} cached events for {job_id[:8]}")
+            for _evt in cached_events:
+                try:
+                    await ws.send_json(_evt)
+                    await asyncio.sleep(0.002)
+                except Exception as e:
+                    logging.error(f"[WS] Failed to send cached event: {e}")
+
+            logging.info(f"[WS] Entering live stream for {job_id[:8]}")
+            while True:
+                _evt = await queue.get()
+                try:
+                    await ws.send_json(_evt)
+                except Exception as e:
+                    logging.error(f"[WS] Failed to send real-time event: {e}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"[WS] Send loop fatal error for {job_id[:8]}: {e}", exc_info=True)
+
+    async def receive_loop():
+        try:
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            logging.info(f"[WS] Client disconnected for {job_id[:8]}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.error(f"[WS] Receive loop error for {job_id[:8]}: {e}", exc_info=True)
+
+    send_task = asyncio.create_task(send_loop())
+    receive_task = asyncio.create_task(receive_loop())
+
+    done, pending = await asyncio.wait(
+        [send_task, receive_task], 
+        return_when=asyncio.FIRST_COMPLETED
+    )
+
+    # Log which task completed first (helps diagnose who closed the connection)
+    for task in done:
+        if task == send_task:
+            logging.info(f"[WS] Send loop ended first for {job_id[:8]}")
+        else:
+            logging.info(f"[WS] Receive loop ended first for {job_id[:8]}")
+
+    for task in pending:
+        task.cancel()
+        
+    job.get("listeners", set()).discard(queue)
     try:
-        # Replay buffered events so users can reconnect after page navigation.
-        for evt in job.get("events", []):
-            await ws.send_json(evt)
-
-        while True:
-            evt = await queue.get()
-            await ws.send_json(evt)
-
-    except WebSocketDisconnect:
+        await ws.close()
+    except Exception:
         pass
-    except Exception as e:
-        try:
-            await ws.send_json({"type": "error", "data": str(e)})
-        except:
-            pass
-    finally:
-        job.get("listeners", set()).discard(queue)
-        try:
-            await ws.close()
-        except:
-            pass
+    logging.info(f"[WS] Connection fully closed for {job_id[:8]}")
 
 
 @app.get("/user/history/{user_id}")
@@ -803,12 +988,39 @@ def user_history(user_id: str):
         ) l ON l.job_id = j.job_id
         WHERE j.user_id=?
         ORDER BY j.created_at DESC
-        LIMIT 50
-        """,
-        (user_id,)
+        """
+        # Removed LIMIT 50 to allow full history visibility
+        , (user_id,)
     ).fetchall()
     conn.close()
     return {"history": [dict(j) for j in jobs]}
+
+
+@app.get("/scrape/job/{job_id}/leads")
+def get_job_leads(job_id: str, x_user_id: str = Header(None)):
+    """Fetch all leads for a given job to display in the UI Data Explorer."""
+    conn = get_db()
+    row = conn.execute("SELECT user_id FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Job not found")
+        
+    if x_user_id and row["user_id"] != x_user_id:
+        conn.close()
+        raise HTTPException(403, "Access denied")
+
+    # If this is a merged job representation, we might need multiple IDs. For now, fetch just this job's leads.
+    leads_rows = conn.execute("SELECT data FROM leads WHERE job_id=?", (job_id,)).fetchall()
+    conn.close()
+
+    leads = []
+    for r in leads_rows:
+        try:
+            leads.append(json.loads(r["data"]))
+        except Exception:
+            pass
+            
+    return {"leads": leads}
 
 
 def require_admin(x_admin_key: str = Header(None)):

@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import Nav from "../components/Nav"
 import SparklesBg from "../components/SparklesBg"
 
-const API = "http://localhost:8000"
-const LIVE_FEED_MAX_ROWS = 600
-const LIVE_FEED_FLUSH_MS = 250
+const API = import.meta.env.VITE_API_URL || "http://localhost:8001"
+const WS_BASE = API.replace(/^http/i, "ws")
+const LIVE_FEED_MAX_ROWS = 200
+const LIVE_FEED_FLUSH_MS = 700
 
 // ── Complete World Database ─────────────────────────────
 const WORLD = {
@@ -460,6 +461,10 @@ export default function DashboardPage({ user, onLogout }) {
   const [resumeCandidate, setResumeCandidate] = useState(null)
   const [resumeBusy, setResumeBusy] = useState(false)
   const [showCountryDD, setShowCountryDD] = useState(false)
+  const [liveUrl, setLiveUrl] = useState({ maps_url: "", website_url: "", name: "" })
+  const [history, setHistory] = useState([])
+  const [showHistory, setShowHistory] = useState(false)
+  const [runtimeStatus, setRuntimeStatus] = useState("")
   const wsRef    = useRef(null)
   const keepSocketAliveRef = useRef(true)
   const tableRef = useRef(null)
@@ -467,10 +472,14 @@ export default function DashboardPage({ user, onLogout }) {
   const pendingLeadsRef = useRef([])
   const pendingStatsRef = useRef({ total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 })
   const flushTimerRef = useRef(null)
+  const heartbeatRef = useRef(null)
+  const retryCountRef = useRef(0)
+  const seenLeadKeysRef = useRef(new Set())
 
   const resetLiveBuffers = () => {
     pendingLeadsRef.current = []
     pendingStatsRef.current = { total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 }
+    seenLeadKeysRef.current = new Set()
     if (flushTimerRef.current) {
       clearTimeout(flushTimerRef.current)
       flushTimerRef.current = null
@@ -499,7 +508,20 @@ export default function DashboardPage({ user, onLogout }) {
     }
   }
 
+  const makeLeadKey = (lead) => {
+    const phone = (lead.Phone || "").replace(/[^0-9]/g, "").trim()
+    if (phone.length >= 6) return `phone::${phone}`
+    const name = (lead.Name || "").toLowerCase().trim()
+    const addr = (lead.Address || "").toLowerCase().trim()
+    return `name::${name}::addr::${addr}`
+  }
+
   const queueLeadForUi = (lead) => {
+    // DEDUP: Skip leads already shown in this session
+    const key = makeLeadKey(lead)
+    if (seenLeadKeysRef.current.has(key)) return
+    seenLeadKeysRef.current.add(key)
+
     pendingLeadsRef.current.push(lead)
     pendingStatsRef.current.total += 1
     if (lead.Owner_Name) pendingStatsRef.current.withOwner += 1
@@ -511,11 +533,12 @@ export default function DashboardPage({ user, onLogout }) {
     }
   }
 
-  const allCountries = Object.keys(WORLD).sort()
-  const filteredCountries = allCountries.filter(c =>
-    c.toLowerCase().includes(countrySearch.toLowerCase())
-  )
-  const cities = country ? Object.keys(WORLD[country]).sort() : []
+  const allCountries = useMemo(() => Object.keys(WORLD).sort(), [])
+  const filteredCountries = useMemo(() => {
+    const q = countrySearch.toLowerCase()
+    return allCountries.filter(c => c.toLowerCase().includes(q))
+  }, [allCountries, countrySearch])
+  const cities = useMemo(() => (country ? Object.keys(WORLD[country]).sort() : []), [country])
 
   useEffect(() => {
     if (city && country) {
@@ -547,32 +570,29 @@ export default function DashboardPage({ user, onLogout }) {
       const data = await res.json()
       const history = data.history || []
 
-      const candidate = history.find((h) => {
-        if (h.status !== "stopped") return false
-        let total = Number(h.total_areas || 0)
-        if (!total) {
-          try { total = JSON.parse(h.areas || "[]").length } catch { total = 0 }
-        }
-        const processed = Number(h.processed_areas || 0)
-        return total > processed
-      })
-
-      if (!candidate) {
+      // Only the most recent scrape is eligible for resume
+      const mostRecent = history[0]
+      if (!mostRecent || mostRecent.status !== "stopped") {
         setResumeCandidate(null)
         return
       }
 
-      let total = Number(candidate.total_areas || 0)
+      let total = Number(mostRecent.total_areas || 0)
       if (!total) {
-        try { total = JSON.parse(candidate.areas || "[]").length } catch { total = 0 }
+        try { total = JSON.parse(mostRecent.areas || "[]").length } catch { total = 0 }
       }
-      const processed = Number(candidate.processed_areas || 0)
+      const processed = Number(mostRecent.processed_areas || 0)
+      if (total <= processed) {
+        setResumeCandidate(null)
+        return
+      }
+
       setResumeCandidate({
-        jobId: candidate.job_id,
+        jobId: mostRecent.job_id,
         remaining: Math.max(0, total - processed),
         processed,
         total,
-        profession: candidate.profession,
+        profession: mostRecent.profession,
       })
     } catch {
       setResumeCandidate(null)
@@ -601,6 +621,7 @@ export default function DashboardPage({ user, onLogout }) {
     resetLiveBuffers()
     setLeads([])
     setCanDownload(false)
+    setRuntimeStatus("")
     setStats({ total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 })
     setProgress({ current: 0, total: 0, query: restartFromBeginning ? "Restarting..." : "Resuming..." })
     setScraping(true)
@@ -631,42 +652,89 @@ export default function DashboardPage({ user, onLogout }) {
 
   const attachSocket = (id, { reset = false } = {}) => {
     if (!id) return
-    wsRef.current?.close()
+
+    // CRITICAL FIX: Strip all event handlers from the old WebSocket BEFORE
+    // closing it. Without this, the old socket's onclose fires and schedules
+    // a ghost reconnection that immediately kills the NEW good connection,
+    // creating the infinite open→close→open→close cascade.
+    if (wsRef.current) {
+      const oldWs = wsRef.current
+      oldWs.onopen = null
+      oldWs.onmessage = null
+      oldWs.onerror = null
+      oldWs.onclose = null
+      wsRef.current = null
+      try { oldWs.close() } catch (e) { /* already closed */ }
+    }
 
     if (reset) {
       resetLiveBuffers()
       setLeads([])
       setStats({ total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 })
+      setRuntimeStatus("")
+      retryCountRef.current = 0
     }
 
-    const ws = new WebSocket(`ws://localhost:8000/ws/${id}`)
+    console.log(`[WS] Connecting to /ws/${id} (attempt ${retryCountRef.current})`)
+    const ws = new WebSocket(`${WS_BASE}/ws/${id}`)
     wsRef.current = ws
+
+    ws.onopen = () => {
+      console.log("[WS] Connection established successfully")
+      retryCountRef.current = 0
+    }
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data)
       if (msg.type === "lead") {
         queueLeadForUi(msg.data)
+      } else if (msg.type === "url") {
+        setLiveUrl(msg.data || { maps_url: "", website_url: "", name: "" })
       } else if (msg.type === "progress") {
         setProgress(msg.data)
+      } else if (msg.type === "info") {
+        setRuntimeStatus(String(msg.data || ""))
+      } else if (msg.type === "block_wait") {
+        const d = msg.data || {}
+        const wait = Number(d.wait_seconds || 0)
+        const attempt = Number(d.retry_attempt || 0)
+        const limit = Number(d.retry_limit || 0)
+        setRuntimeStatus(`Blocked by Google. Waiting ${wait}s (attempt ${attempt}/${limit}) then auto-resuming...`)
       } else if (msg.type === "done") {
         flushLiveFeed()
         keepSocketAliveRef.current = false
         setScraping(false)
         setCanDownload((msg.data?.total || 0) > 0)
+        setRuntimeStatus("Completed")
         clearActiveJob()
         refreshResumeCandidate()
       } else if (msg.type === "error") {
         flushLiveFeed()
         keepSocketAliveRef.current = false
         setScraping(false)
+        setRuntimeStatus(String(msg.data || "Stopped with an error"))
         clearActiveJob()
       }
     }
 
-    ws.onerror = () => {}
-    ws.onclose = () => {
+    ws.onerror = (err) => {
+      console.error("[WS] Connection error", err)
+    }
+    
+    ws.onclose = (event) => {
+      console.log(`[WS] Disconnected (code: ${event.code}, reason: ${event.reason || "none"})`)
+      // Only reconnect if THIS socket is still the active one.
+      // If attachSocket was called again, wsRef.current would be a different instance,
+      // so this stale onclose should NOT trigger reconnection.
+      if (ws !== wsRef.current) return
+
       if (keepSocketAliveRef.current && localStorage.getItem(ACTIVE_JOB_KEY) === id) {
+        const timeoutDelay = Math.min(1000 * Math.pow(2, retryCountRef.current), 10000)
+        retryCountRef.current += 1
+        console.log(`[WS] Scheduling reconnect in ${timeoutDelay}ms`)
         setTimeout(async () => {
+          // Double-check conditions haven't changed during the delay
+          if (!keepSocketAliveRef.current || localStorage.getItem(ACTIVE_JOB_KEY) !== id) return
           const shouldReconnect = await canReconnectJob(id)
           if (!shouldReconnect) {
             keepSocketAliveRef.current = false
@@ -675,7 +743,7 @@ export default function DashboardPage({ user, onLogout }) {
             return
           }
           attachSocket(id)
-        }, 1200)
+        }, timeoutDelay)
       }
     }
   }
@@ -709,6 +777,7 @@ export default function DashboardPage({ user, onLogout }) {
     resetLiveBuffers()
     setLeads([]); setScraping(true)
     setCanDownload(false)
+    setRuntimeStatus("")
     setStats({ total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 })
     setProgress({ current: 0, total: finalAreas.length, query: "" })
     try {
@@ -730,8 +799,15 @@ export default function DashboardPage({ user, onLogout }) {
   const stopScrape = () => {
     flushLiveFeed()
     keepSocketAliveRef.current = false
+    setRuntimeStatus("Stopped by user")
     clearActiveJob()
-    wsRef.current?.close()
+    if (wsRef.current) {
+      wsRef.current.onclose = null
+      wsRef.current.onerror = null
+      wsRef.current.onmessage = null
+      wsRef.current.close()
+      wsRef.current = null
+    }
     if (jobId) fetch(`${API}/scrape/stop/${jobId}`, { method: "POST" })
     setScraping(false)
     setTimeout(() => {
@@ -750,6 +826,33 @@ export default function DashboardPage({ user, onLogout }) {
     URL.revokeObjectURL(url)
   }
 
+  const deleteJob = async (targetJobId) => {
+    if (!confirm("Delete this scrape and all its leads? This cannot be undone.")) return
+    try {
+      await fetch(`${API}/scrape/job/${targetJobId}`, {
+        method: "DELETE",
+        headers: { "x-user-id": user.id },
+      })
+      refreshHistory()
+      refreshResumeCandidate()
+      if (targetJobId === jobId) {
+        setJobId(null)
+        setCanDownload(false)
+        setRuntimeStatus("")
+        setLeads([])
+        setStats({ total: 0, withOwner: 0, withEmail: 0, withWebsite: 0 })
+      }
+    } catch {}
+  }
+
+  const refreshHistory = async () => {
+    try {
+      const res = await fetch(`${API}/user/history/${user.id}`)
+      const data = await res.json()
+      setHistory(data.history || [])
+    } catch {}
+  }
+
   const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0
 
   useEffect(() => {
@@ -766,6 +869,19 @@ export default function DashboardPage({ user, onLogout }) {
         if (!mounted) return
         if (status?.running) {
           setScraping(true)
+          if (status.profession) {
+            setProfession(status.profession)
+            setCustomPro(status.profession)
+          }
+          if (status.location) {
+            if (!areas.includes(status.location)) {
+              setAreas(p => {
+                const unique = new Set([...p, status.location])
+                return Array.from(unique)
+              })
+            }
+            setSelAreas([status.location])
+          }
           attachSocket(savedJobId, { reset: true })
         } else {
           setScraping(false)
@@ -781,13 +897,79 @@ export default function DashboardPage({ user, onLogout }) {
       mounted = false
       keepSocketAliveRef.current = false
       resetLiveBuffers()
-      wsRef.current?.close()
+      if (wsRef.current) {
+        wsRef.current.onclose = null
+        wsRef.current.onerror = null
+        wsRef.current.onmessage = null
+        wsRef.current.close()
+        wsRef.current = null
+      }
     }
   }, [ACTIVE_JOB_KEY])
 
   useEffect(() => {
     refreshResumeCandidate()
+    refreshHistory()
   }, [user.id])
+
+  // Sleep/wake detection — auto-reconnect WebSocket when laptop resumes
+  useEffect(() => {
+    const handleVisibility = async () => {
+      if (document.visibilityState === "visible") {
+        const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY)
+        if (!savedJobId) return
+        try {
+          const res = await fetch(`${API}/scrape/heartbeat/${savedJobId}`)
+          const hb = await res.json()
+          if (hb.alive && hb.status === "running") {
+            // Reconnect the WebSocket
+            keepSocketAliveRef.current = true
+            setScraping(true)
+            attachSocket(savedJobId)
+          } else {
+            // Job died while sleeping
+            keepSocketAliveRef.current = false
+            setScraping(false)
+            setCanDownload(true)
+            clearActiveJob()
+            refreshResumeCandidate()
+            refreshHistory()
+          }
+        } catch {
+          // Backend unreachable
+          keepSocketAliveRef.current = false
+          setScraping(false)
+          clearActiveJob()
+        }
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibility)
+    return () => document.removeEventListener("visibilitychange", handleVisibility)
+  }, [])
+
+  // Heartbeat polling — detect if scrape died while running
+  useEffect(() => {
+    if (scraping && jobId) {
+      heartbeatRef.current = setInterval(async () => {
+        try {
+          const res = await fetch(`${API}/scrape/heartbeat/${jobId}`)
+          const hb = await res.json()
+          if (!hb.alive || hb.status !== "running") {
+            flushLiveFeed()
+            keepSocketAliveRef.current = false
+            setScraping(false)
+            setCanDownload(true)
+            clearActiveJob()
+            refreshResumeCandidate()
+            refreshHistory()
+          }
+        } catch {}
+      }, 15000) // every 15 seconds
+    } else {
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current)
+    }
+    return () => { if (heartbeatRef.current) clearInterval(heartbeatRef.current) }
+  }, [scraping, jobId])
 
   const chipStyle = (selected) => ({
     padding: "4px 10px", fontSize: 11, borderRadius: 100, cursor: "pointer",
@@ -971,6 +1153,24 @@ export default function DashboardPage({ user, onLogout }) {
                   </div>
                   <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
                   <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6, textAlign: "right" }}>{pct}% complete</div>
+                  {!!runtimeStatus && <div style={{ marginTop: 8, fontSize: 12, color: "var(--accent-gold)" }}>{runtimeStatus}</div>}
+                  {scraping && liveUrl.name && (
+                    <div style={{ marginTop: 10, padding: "10px 14px", background: "var(--bg-surface)", borderRadius: "var(--radius-sm)", fontSize: 12 }}>
+                      <div style={{ color: "var(--accent-cyan)", fontWeight: 600, marginBottom: 4 }}>Now scraping: {liveUrl.name}</div>
+                      {liveUrl.maps_url && (
+                        <a href={liveUrl.maps_url} target="_blank" rel="noreferrer" style={{ color: "var(--text-muted)", fontSize: 11, textDecoration: "none", wordBreak: "break-all" }}>
+                          📍 {liveUrl.maps_url.substring(0, 80)}...
+                        </a>
+                      )}
+                      {liveUrl.website_url && (
+                        <div style={{ marginTop: 4 }}>
+                          <a href={liveUrl.website_url} target="_blank" rel="noreferrer" style={{ color: "var(--text-muted)", fontSize: 11, textDecoration: "none" }}>
+                            🌐 {liveUrl.website_url.substring(0, 60)}
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -994,13 +1194,23 @@ export default function DashboardPage({ user, onLogout }) {
                         {leads.map((lead,i) => (
                           <tr key={i}>
                             <td>
-                              <div>{lead.Name||"—"}</div>
+                              <a href={lead["Maps URL"]} target="_blank" rel="noreferrer" style={{ color: "inherit", textDecoration: "none" }}>
+                                <div>{lead.Name||"—"} <span style={{ fontSize: 10, opacity: 0.5 }}>↗</span></div>
+                              </a>
                               <div style={{ fontSize:10,color:"var(--text-muted)" }}>{lead.Category}</div>
                             </td>
                             <td>{lead.Phone||"—"}</td>
                             <td style={{ color:lead.Owner_Name?"var(--accent-violet)":"var(--text-muted)" }}>{lead.Owner_Name||"—"}</td>
                             <td style={{ maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{lead.Email||lead.Owner_Email_Guesses?.split(" | ")[0]||"—"}</td>
-                            <td><span className={`badge ${lead.Website?"badge-green":"badge-red"}`}>{lead.Website?"Yes":"No"}</span></td>
+                            <td>
+                              {lead.Website ? (
+                                <a href={lead.Website} target="_blank" rel="noreferrer" className="badge badge-green" style={{ textDecoration: "none" }}>
+                                  Visit Website ↗
+                                </a>
+                              ) : (
+                                <span className="badge badge-red">No Website</span>
+                              )}
+                            </td>
                             <td>{lead.Dev_Opportunity==="Yes"?<span className="badge badge-gold">🔥</span>:<span style={{color:"var(--text-muted)"}}>—</span>}</td>
                           </tr>
                         ))}
@@ -1008,6 +1218,59 @@ export default function DashboardPage({ user, onLogout }) {
                     </table>
                   )}
                 </div>
+              </div>
+
+              {/* Scrape History */}
+              <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+                <div
+                  style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+                  onClick={() => { setShowHistory(!showHistory); if (!showHistory) refreshHistory() }}
+                >
+                  <p style={{ fontSize: 13, fontWeight: 600 }}>Scrape History</p>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{showHistory ? "▼" : "▶"} {history.length} jobs</span>
+                </div>
+                {showHistory && (
+                  <div style={{ maxHeight: 360, overflowY: "auto" }}>
+                    {history.length === 0 ? (
+                      <div style={{ padding: "30px 20px", textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>No scrape jobs yet</div>
+                    ) : history.map((h) => (
+                      <div key={h.job_id} style={{ padding: "12px 20px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-primary)" }}>
+                            {h.profession} — {h.location || "Unknown"}
+                          </div>
+                          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+                            {h.effective_lead_count || h.lead_count || 0} leads · {h.processed_areas || 0}/{h.total_areas || "?"} areas ·{" "}
+                            <span className={`badge ${h.status === "completed" ? "badge-green" : h.status === "stopped" ? "badge-gold" : "badge-red"}`}>
+                              {h.status}
+                            </span>
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {(h.effective_lead_count || h.lead_count || 0) > 0 && (
+                            <button
+                              className="btn btn-ghost"
+                              style={{ padding: "4px 10px", fontSize: 11 }}
+                              onClick={async () => {
+                                const res = await fetch(`${API}/scrape/download/${h.job_id}`)
+                                const blob = await res.blob()
+                                const url = URL.createObjectURL(blob)
+                                const a = document.createElement("a")
+                                a.href = url; a.download = `leads_${h.niche || "job"}.csv`; a.click()
+                                URL.revokeObjectURL(url)
+                              }}
+                            >↓ CSV</button>
+                          )}
+                          <button
+                            className="btn btn-danger"
+                            style={{ padding: "4px 10px", fontSize: 11 }}
+                            onClick={() => deleteJob(h.job_id)}
+                          >🗑</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>

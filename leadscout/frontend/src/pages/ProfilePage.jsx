@@ -12,6 +12,9 @@ export default function ProfilePage({ user, onLogout }) {
   const [loading, setLoading] = useState(true)
   const [workingJobId, setWorkingJobId] = useState(null)
   const [downloadingAll, setDownloadingAll] = useState(false)
+  const [viewingJob, setViewingJob] = useState(null)
+  const [viewingLeads, setViewingLeads] = useState([])
+  const [viewingLoading, setViewingLoading] = useState(false)
   const pollingBusyRef = useRef(false)
 
   const getTotalAreas = (job) => {
@@ -136,11 +139,27 @@ export default function ProfilePage({ user, onLogout }) {
     }
   }
 
+  const deleteJob = async (targetJobId) => {
+    if (!window.confirm("Delete this scrape and all its leads? This cannot be undone.")) return
+    try {
+      await fetch(`${API}/scrape/job/${targetJobId}`, {
+        method: "DELETE",
+        headers: { "x-user-id": user.id },
+      })
+      refreshHistory()
+    } catch {}
+  }
+
   useEffect(() => {
     refreshHistory({ firstLoad: true })
-    const id = setInterval(() => refreshHistory(), 8000)
+    const id = setInterval(() => refreshHistory(), 15000)
     return () => clearInterval(id)
   }, [user.id])
+
+  const openJobDashboard = (jobId) => {
+    localStorage.setItem(ACTIVE_JOB_KEY, jobId)
+    navigate("/dashboard")
+  }
 
   const resumeFromRow = async (job, restartFromBeginning = false) => {
     setWorkingJobId(job.job_id)
@@ -196,6 +215,30 @@ export default function ProfilePage({ user, onLogout }) {
     () => history.reduce((s, h) => s + Number(h.effective_lead_count || 0), 0),
     [history]
   )
+
+  const viewLeads = async (job) => {
+    setViewingJob(job)
+    setViewingLoading(true)
+    setViewingLeads([])
+    
+    // If it's a merged job, we should ideally fetch all merged_job_ids, but for now we fetch the root one or pass multiple.
+    // The endpoint currently takes one string. We can pass comma-separated if we update backend, 
+    // but right now it only supports one. Let's just fetch the root job's leads.
+    const idsToFetch = job.merged_job_ids ? job.merged_job_ids[0] : job.job_id
+    
+    try {
+      const res = await fetch(`${API}/scrape/job/${idsToFetch}/leads`, {
+        headers: { "x-user-id": user.id }
+      })
+      if (!res.ok) throw new Error("Failed")
+      const data = await res.json()
+      setViewingLeads(data.leads || [])
+    } catch {
+      setViewingLeads([])
+    } finally {
+      setViewingLoading(false)
+    }
+  }
 
   return (
     <div className="page">
@@ -264,7 +307,11 @@ export default function ProfilePage({ user, onLogout }) {
                             </span>
                           )}
                           {((h.status==="completed" || h.status==="stopped") && Number(h.effective_lead_count||0) > 0) && (
-                            <button className="btn btn-ghost" style={{ padding:"4px 12px",fontSize:11 }} onClick={() => download(h.job_id,`${h.profession}_${h.job_id?.slice(0,8)}.csv`)}>↓ CSV</button>
+                            <>
+                              <button className="btn btn-ghost" style={{ padding:"4px 12px",fontSize:11 }} onClick={() => viewLeads(h)}>👁 View Data</button>
+                              <button className="btn btn-ghost" style={{ padding:"4px 12px",fontSize:11 }} onClick={() => download(h.job_id,`${h.profession}_${h.job_id?.slice(0,8)}.csv`)}>↓ CSV</button>
+                              <button className="btn btn-ghost" style={{ padding:"4px 12px",fontSize:11, color: "var(--accent-red)" }} onClick={() => deleteJob(h.job_id)}>🗑 Delete</button>
+                            </>
                           )}
                           {canResumeFromStopped(h) && (
                             <button
@@ -296,6 +343,66 @@ export default function ProfilePage({ user, onLogout }) {
           </div>
         </div>
       </div>
+
+      {viewingJob && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "var(--bg-void)", zIndex: 1000, display: "flex", flexDirection: "column" }} className="anim-fade-in">
+          <div style={{ padding: "20px 40px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--bg-deep)" }}>
+            <div>
+              <h2 style={{ fontSize: 20, fontWeight: 800, letterSpacing: "-0.02em" }}>Data Explorer</h2>
+              <p style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 4 }}>
+                {viewingJob.profession} in {viewingJob.location} — {viewingLeads.length} leads found
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: 12 }}>
+              <button className="btn btn-primary" onClick={() => download(viewingJob.job_id, `${viewingJob.profession}_auto.csv`)}>Download CSV</button>
+              <button className="btn btn-ghost" onClick={() => setViewingJob(null)}>Close</button>
+            </div>
+          </div>
+          <div style={{ flex: 1, overflow: "auto", padding: 20 }}>
+            {viewingLoading ? (
+              <div style={{ textAlign: "center", padding: 60, color: "var(--text-muted)" }}>Loading entire dataset...</div>
+            ) : viewingLeads.length === 0 ? (
+              <div style={{ textAlign: "center", padding: 60, color: "var(--text-muted)" }}>No data available.</div>
+            ) : (
+              <table className="data-table">
+                <thead><tr><th>Business</th><th>Phone</th><th>Owner</th><th>Email</th><th>Website</th><th>Socials</th></tr></thead>
+                <tbody>
+                  {viewingLeads.map((lead, i) => (
+                    <tr key={i}>
+                      <td>
+                        <a href={lead["Maps URL"]} target="_blank" rel="noreferrer" style={{ color: "var(--text-primary)", textDecoration: "none", fontWeight: 600 }}>
+                          {lead.Name || "—"} ↗
+                        </a>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4 }}>{lead.Category}</div>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2, maxWidth: 250, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{lead.Address}</div>
+                      </td>
+                      <td>{lead.Phone || "—"}</td>
+                      <td style={{ color: lead.Owner_Name ? "var(--accent-violet)" : "var(--text-muted)", fontWeight: lead.Owner_Name ? 600 : 400 }}>
+                        {lead.Owner_Name || "—"}
+                      </td>
+                      <td style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {lead.Email || lead.Owner_Email_Guesses?.split(" | ")[0] || "—"}
+                      </td>
+                      <td>
+                        {lead.Website ? (
+                          <a href={lead.Website} target="_blank" rel="noreferrer" className="badge badge-green" style={{ textDecoration: "none", display: "inline-block" }}>Website ↗</a>
+                        ) : <span className="badge badge-red">No Website</span>}
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", gap: 4 }}>
+                          {lead.LinkedIn && <a href={lead.LinkedIn} target="_blank" rel="noreferrer" className="badge badge-cyan" style={{ textDecoration: "none" }}>IN ↗</a>}
+                          {lead.Facebook && <a href={lead.Facebook} target="_blank" rel="noreferrer" className="badge badge-cyan" style={{ textDecoration: "none", background: "rgba(59, 130, 246, 0.1)", color: "#3b82f6" }}>FB ↗</a>}
+                          {lead.Instagram && <a href={lead.Instagram} target="_blank" rel="noreferrer" className="badge badge-cyan" style={{ textDecoration: "none", background: "rgba(236, 72, 153, 0.1)", color: "#ec4899" }}>IG ↗</a>}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

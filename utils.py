@@ -40,10 +40,10 @@ def save_seen_leads(seen):
 
 
 def make_lead_key(record):
-    phone = str(record.get("Phone", "")).strip()
+    phone = re.sub(r"[^0-9]", "", str(record.get("Phone", ""))).strip()
     name = str(record.get("Name", "")).strip().lower()
     address = str(record.get("Address", "")).strip().lower()
-    if phone:
+    if len(phone) >= 6:
         return f"phone::{phone}"
     return f"name::{name}::addr::{address}"
 
